@@ -3,10 +3,20 @@
 author: Lu Lin
 date: 8/6/2018
 """
-
-
-import numpy as np 
 import os, sys, glob
+import socket
+machine_name = socket.gethostname()
+print("="*50)
+print("Machine name: {}".format(machine_name))
+print("="*50)
+if machine_name == "lulin-QX-350-Series":
+	os.environ["CUDA_VISIBLE_DEVICES"]="0"
+	sys.path.append("/home/lulin/Desktop/Desktop/Python_projets/my_packages")
+else:
+	os.environ["CUDA_VISIBLE_DEVICES"]="1"
+	sys.path.append("/home/lulin/na4/my_packages")
+import numpy as np 
+
 from functools import partial
 import keras
 import keras.backend as K
@@ -117,11 +127,11 @@ class SimpleGANs(_DLalgo):
 		self.algo = algo #"WGAN-GP" # "WGAN", "JS", "Hinge-JS"
 		self.noise_size = 128
 		self.gp_method = "two_sides" # "two_sides" #"one_side"
-		self.singular_value = 1.
+		self.singular_value = 10.
 		self.GRADIENT_PENALTY_WEIGHT = 1. # Exp3 1.0
 	
 		self.critic_steps = 5
-		self.use_He_initialization = True
+		self.use_He_initialization = False
 		self.my_initializer = lambda :he_normal() if self.use_He_initialization else "glorot_uniform" # TODO
 
 		
@@ -208,7 +218,7 @@ class SimpleGANs(_DLalgo):
 				self.Critic.trainable = True
 				self.Generator.trainable = False
 				self.combined_critic.compile(loss=[wasserstein_loss, wasserstein_loss], 
-											optimizer=self.optimizer, 
+											optimizer=self.optimizerD, 
 											metrics=[my_critic_acc])
 			elif self.algo == "WGAN-GP":
 				
@@ -618,27 +628,36 @@ class DataDistribution(object):
 if __name__ == "__main__":
 	print("Start")
 
-
-	gan = SimpleGANs(dim=2, algo="WGAN-GP")
+	# if not os.path.exists("./weights"):
+	# 	os.makedirs("./weights")
+	# if not os.path.exists("./output/figures"):
+	# 	os.makedirs("./output/figures")
+	# if not os.path.exists("./output/history"):
+	# 	os.makedirs("./output/history")
+	ALGO = "WGAN-GP"
+	gan = SimpleGANs(dim=2, algo=ALGO)
 	gan.build_model()
 	# gan.build_model(fromdir="./weights/WGAN-GP/Exp1_bis")
 	gan.summary()
-	# gan.load_data("normal_source.npy", "grid_100.npy", shuffle=True)
-	gan.load_data("normal_source.npy", "6_clusters.npy", shuffle=True)
+	# gan.load_data("./data/normal_source.npy", "./data/grid_100.npy", shuffle=True)
+	# gan.load_data("./data/normal_source.npy", "./data/6_clusters.npy", shuffle=True)
+	gan.load_data("./data/normal_source.npy", "./data/spiral_50.npy", shuffle=True)
 
 
 
 	try:
-		EXP_NUM = "Exp23"
-		gan.write_tensorboard_graph(to_dir="./weights/WGAN-GP/{}/board".format(EXP_NUM), save_png2dir="./weights/WGAN-GP/{}".format(EXP_NUM))
-		gan.reset_history_in_folder("./output/history/WGAN-GP/{}".format(EXP_NUM))
+		EXP_NUM = "Exp45"
+		gan.write_tensorboard_graph(to_dir="./weights/{}/{}/board".format(ALGO, EXP_NUM), 
+			save_png2dir="./weights/{}/{}".format(ALGO, EXP_NUM))
+		gan.reset_history_in_folder("./output/history/{}/{}".format(ALGO, EXP_NUM))
 		gan.train(100000, batch_size=128, 
-			savefig2dir="./output/figures/WGAN-GP/{}".format(EXP_NUM), 
-			savehis2dir="./output/history/WGAN-GP/{}".format(EXP_NUM), 
-			saveWeights2dir="./weights/WGAN-GP/{}".format(EXP_NUM),
-			plot_range=(-60,60))
+			savefig2dir="./output/figures/{}/{}".format(ALGO, EXP_NUM), 
+			savehis2dir="./output/history/{}/{}".format(ALGO, EXP_NUM), 
+			saveWeights2dir="./weights/{}/{}".format(ALGO, EXP_NUM),
+			# plot_range=(-60,60))
+			plot_range=(-120,120))
 	except KeyboardInterrupt:
-		gan.save_model("./weights/WGAN-GP/{}_bis".format(EXP_NUM))
+		gan.save_model("./weights/{}/{}_bis".format(ALGO, EXP_NUM))
 		sys.exit(0)
 
 
@@ -663,16 +682,18 @@ if __name__ == "__main__":
 
 
 	############# Data generation ###############
+	# if not os.path.exists("./data"):
+	# 	os.makedirs("./data")
 	# data = DataDistribution(2)
 	
 	# X = data.create2(500, show=True, seed=17)
-	# np.save("6_clusters.npy", X)
+	# np.save("./data/6_clusters.npy", X)
 
 	# X = data.create3(3000, show=True, seed=17)
-	# np.save("normal_source.npy", X)
+	# np.save("./data/normal_source.npy", X)
 
 	# X = data.create4(50, show=True, seed=17)
-	# np.save("grid_100.npy", X)
+	# np.save("./data/grid_100.npy", X)
 	
 	# X = data.create5(60, show=True, seed=17)
-	# np.save("spiral_50.npy", X)
+	# np.save("./data/spiral_50.npy", X)
