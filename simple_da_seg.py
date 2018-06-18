@@ -22,7 +22,6 @@ import keras
 import keras.backend as K
 import tensorflow as tf
 
-from DataGenerators import NpyGenerator
 def reset_session(gpu_fraction=0.1):
 	
 	
@@ -52,6 +51,9 @@ from DLalgors import _DLalgo
 from keras.utils import plot_model
 from keras.initializers import he_normal, he_uniform
 
+from sklearn.utils import shuffle as sk_shuffle
+from draw import draw_clouds
+from DataGenerators import NpyGenerator
 def wasserstein_loss(y_gt, y_pre):
 	return -K.mean(y_gt*y_pre)
 def my_critic_acc(y_true, y_pred):
@@ -80,12 +82,11 @@ class RandomWeightedAverage(_Merge):
 		return (weights * inputs[0]) + ((1 - weights) * inputs[1])
 
 
-
 		
-class SimpleGANs(_DLalgo):
-	"""docstring for SimpleGANs"""
-	def __init__(self, dim=2, algo="WGAN-GP", **kwargs):
-		super(SimpleGANs, self).__init__()
+class SimpleDaSeg(_DLalgo):
+	"""docstring for SimpleDaSeg"""
+	def __init__(self, dim=2, algo="WGAN-GP"):
+		super(SimpleDaSeg, self).__init__()
 		self.dim = dim
 		self.opt_D_config = {"lr":5*1e-5, "beta_1": 0.0, "beta_2": 0.9}
 		self.opt_G_config = {"lr": 1e-4, "beta_1":0.0, "beta_2":0.9}
@@ -94,34 +95,39 @@ class SimpleGANs(_DLalgo):
 		self.algo = algo #"WGAN-GP" # "WGAN", "JS", "Hinge-JS"
 		self.noise_size = 128
 		self.gp_method = "two_sides" # "two_sides" #"one_side"
-		self.singular_value = 100.
-		self.GRADIENT_PENALTY_WEIGHT = 10. # Exp3 1.0
+		self.singular_value = 1.
+		self.GRADIENT_PENALTY_WEIGHT = 1. # Exp3 1.0
 	
 		self.critic_steps = 5
 		self.use_He_initialization = False
 		self.my_initializer = lambda :he_normal() if self.use_He_initialization else "glorot_uniform" # TODO
 
-		##### Set up the other attributes
-		for key in kwargs:
-			setattr(self, key, kwargs[key])
+
+		self.lambda_adv = 100
+		self.lambda_seg = 1 
+		self.loss_weights_adv = K.variable(self.lambda_adv)
+		self.loss_weights_seg = K.variable(self.lambda_seg)
+		
 		# self.arg = arg
-	def load_data(self, source, target, shuffle=True):
+	def load_data(self, filepaths=[], shuffle=True):
 		print("Loading dataset from npy files...")
-		self.dataA = np.load(source)
-		self.dataB = np.load(target)
-		self.source_name = source.split("/")[-1]
-		self.target_name = target.split("/")[-1]
+		self.dataA = np.load(filepaths[0])
+		self.dataB = np.load(filepaths[1])
+		maskA = np.load(filepaths[2])
+		maskB = np.load(filepaths[3])
+		self.source_name = filepaths[0].split("/")[-1]
+		self.target_name = filepaths[1].split("/")[-1]
+		# if shuffle:
+		# 	np.random.shuffle(self.dataA)
+		# 	np.random.shuffle(self.dataB)
 		print("+ Done.")
 		
 		print("Building data generator...")
-		self.dataA = NpyGenerator(self.dataA)
-		self.dataB = NpyGenerator(self.dataB)
-		if shuffle:
-			print("Shuffling data...")
-			self.dataA.shuffle()
-			self.dataB.shuffle()
-			# np.random.shuffle(self.dataA)
-			# np.random.shuffle(self.dataB)
+		self.dataA = NpyGenerator(self.dataA, Y=maskA)
+		self.dataB = NpyGenerator(self.dataB, Y=maskB)
+		print("Shuffling datasets...")
+		self.dataA.shuffle()
+		self.dataB.shuffle()
 		print("+ Done.")
 		print("Preprocessing dataset...")
 		self.dataA.preprocessing()
@@ -164,6 +170,18 @@ class SimpleGANs(_DLalgo):
 		o = Dense(1, activation=None, kernel_initializer=self.my_initializer())(l)
 		model = Model(inputs=i, outputs=o)
 		return model
+	def build_segmenter(self, features_size=2):
+		i = Input(shape=(features_size, ), name="features_vec") # noise vector size=128
+		l = Dense(100, activation=None, kernel_initializer=self.my_initializer())(i)
+		l = LeakyReLU(alpha=0.2)(l)
+		l = Dense(100, activation=None, kernel_initializer=self.my_initializer())(l)
+		l = LeakyReLU(alpha=0.2)(l)
+		l = Dense(50, activation=None, kernel_initializer=self.my_initializer())(l)
+		l = LeakyReLU(alpha=0.2)(l)
+		o = Dense(2, activation='sigmoid', kernel_initializer=self.my_initializer())(l)
+		model = Model(inputs=i, outputs=o)
+		return model
+
 	def build_model(self, fromdir=None):
 		if fromdir is None:
 			noise = Input(shape=(self.noise_size,), name="noise")
@@ -171,9 +189,12 @@ class SimpleGANs(_DLalgo):
 			target = Input(shape=(self.dim, ), name="target")
 			self.Generator = self.build_generator(features_size=self.dim)
 			self.Critic = self.build_critic(features_size=self.dim)
+			self.Seg = self.build_segmenter(features_size=self.dim)
+		
 			self.Generator.name = "Generator"
 			self.Critic.name = "Critic"
-			
+			self.Seg.name = "Segmenter" 
+
 			fake = self.Generator([noise, source])
 			fake_score = self.Critic(fake)
 			real_score = self.Critic(target)
@@ -211,17 +232,20 @@ class SimpleGANs(_DLalgo):
 											optimizer=self.optimizerD, 
 											metrics=[my_critic_acc])
 			
-
+			mask_pred = self.Seg(fake)
+			# mask_pred = self.seg(Lambda(lambda x: 0.5*x+0.5)(fake_B))
 			self.Generator.trainable = True
 			self.Critic.trainable = False
-			self.combined_generator = Model(inputs=[noise, source], outputs=[fake_score])
-			self.combined_generator.compile(loss=[wasserstein_loss], 
+			self.combined_generator = Model(inputs=[noise, source], outputs=[fake_score, mask_pred])
+			self.combined_generator.compile(loss=[wasserstein_loss, 'binary_crossentropy'], 
 											optimizer=self.optimizerG, 
+											loss_weights=[self.loss_weights_adv, self.loss_weights_seg], 
 											metrics=["acc"])
 
 			# import ipdb; ipdb.set_trace()
 			
 		else:
+			raise ValueError("Not implemented error.")
 			## fromdir = ["./critic.h5", "./generator.h5", "./D_model.h5", "./G_model.h5"]
 
 			### Method 1: Re-compile
@@ -301,6 +325,7 @@ class SimpleGANs(_DLalgo):
 		try:
 			plot_model(self.Critic, to_file=os.path.join(save_png2dir, "critic.png"))
 			plot_model(self.Generator, to_file=os.path.join(save_png2dir, "generator.png"))
+			plot_model(self.Seg, to_file=os.path.join(save_png2dir, "segmenter.png"))
 		except:
 			pass
 	def summary(self):
@@ -308,16 +333,17 @@ class SimpleGANs(_DLalgo):
 		print("Critic summary:")
 		self.Critic.summary()
 		print("="*50)
+		print("Segmenter summary:")
+		self.Seg.summary()
+		print("="*50)
 		print("Critic model summary:")
 		self.combined_critic.summary()
 		print("="*50)
 		print("Generator model summary:")
 		self.combined_generator.summary()
 
-	def save_weights(self, save2dir=None):
-		if not os.path.exists(save2dir):
-			os.makedirs(save2dir)
-		self.combined_generator.save_weights(os.path.join(save2dir, "combined_model_weights.h5"))
+	def save_weights(self):
+		self.combined_generator.save_weights("./model_weights.h5")
 		
 	def save_model(self, save2dir=None):
 		if not os.path.exists(save2dir):
@@ -325,6 +351,7 @@ class SimpleGANs(_DLalgo):
 
 		self.Critic.save(os.path.join(save2dir, "critic.h5"))
 		self.Generator.save(os.path.join(save2dir, "generator.h5"))
+		self.Seg.save(os.path.join(save2dir, "seg.h5"))
 		self.combined_critic.save(os.path.join(save2dir, "D_model.h5"))
 		self.combined_generator.save(os.path.join(save2dir, "G_model.h5"))
 
@@ -332,9 +359,9 @@ class SimpleGANs(_DLalgo):
 		for filepath in glob.glob(os.path.join(dirpath, "*.csv")):
 			os.remove(filepath)
 
-	def load_only_generator_weights(self, weights_path="./model_weights.h5"):
+	def load_only_generator_weights(self):
 		print("Loading pretrained weights (only for G)...")
-		self.combined_generator.load_weights(weights_path)
+		self.combined_generator.load_weights("./model_weights.h5")
 		g_weights = self.Generator.get_weights()
 		# reset_session()
 		K.clear_session()
@@ -368,8 +395,10 @@ class SimpleGANs(_DLalgo):
 
 		st = time()
 		for iteration in range(iterations):
-			
-			if (iteration % 100 == 0): #  and (iteration>0) # plot initial clouds to see if they have non-zeros overlap area !
+			seg_test_buffer = []
+			if (iteration % 100 == 0): #  and (iteration>0)
+				###### Show the deplacement of data distribution ######
+				# plot initial clouds to see if they have non-zeros overlap area !
 				Z = np.random.normal(0,1, (self.dataA.N, self.noise_size))
 				# B = self.dataB.X * (self.dataB.range) + self.dataB.min
 				B = self.dataB.X * (self.dataB.range/2) + self.dataB.min + (self.dataB.range/2)
@@ -377,14 +406,25 @@ class SimpleGANs(_DLalgo):
 				Y = self.Generator.predict([Z, self.dataA.X])
 				# Y = Y*self.dataA.range + self.dataA.min
 				# Y = Y* (self.dataA.range/2) + self.dataA.min + (self.dataA.range/2)
+				mask_predY = self.Seg.predict(Y)
+
+				## Rescale for visualization
 				Y = Y* (self.dataB.range/2) + self.dataB.min + (self.dataB.range/2)
 				limite = plot_range
-				plt.figure()
+				
+				mask_predY = np.round(mask_predY)
+				# import ipdb;ipdb.set_trace()
+				### TODO only work in 2D assert self.dim == 2
+				maskB_label = self.dataB.Y[:, 0]*2+self.dataB.Y[:, 1]
+				mask_predY = mask_predY[:,0]*2+mask_predY[:,1]
+				fig = plt.figure()
+				ax = fig.add_subplot(111)
 				plt.title("Iter {}".format(iteration))
 				plt.xlim(limite)
 				plt.ylim(limite)
-				plt.scatter(B[:,0], B[:,1], label="target", color='red')
-				plt.scatter(Y[:,0], Y[:,1], label="fake", alpha=0.5, color='green')
+				scatter1 = ax.scatter(B[:, 0], B[:, 1],c=maskB_label, cmap=plt.cm.jet, alpha=0.6, label="target")
+				scatter2 = ax.scatter(Y[:, 0], Y[:, 1],c=mask_predY, cmap=plt.cm.jet, alpha=0.5, marker="+", label="fake")
+				plt.colorbar(scatter1)
 				plt.legend(loc="best")
 				plt.savefig(os.path.join(savefig2dir, "iter_{}.png".format(iteration)))
 				plt.close()
@@ -392,8 +432,8 @@ class SimpleGANs(_DLalgo):
 			for _ in range(self.critic_steps):
 				z = np.random.normal(0,1, (batch_size,self.noise_size))
 				# inputs=[noise, source, target], outputs=[fake_score, real_score]
-				x_source = self.dataA.next(batch_size=batch_size)
-				x_target = self.dataB.next(batch_size=batch_size)
+				x_source, _ = self.dataA.next(batch_size=batch_size)
+				x_target, _ = self.dataB.next(batch_size=batch_size)
 				pos = np.ones((batch_size, 1))
 				neg = -pos
 				if self.algo == "WGAN":
@@ -402,26 +442,43 @@ class SimpleGANs(_DLalgo):
 					dummy_y = pos #np.zeros((batch_size, 1)) # it's useless
 					d_history = self.combined_critic.train_on_batch([z, x_source, x_target], [neg, pos, dummy_y])					
 
+
+			x_source, y_source = self.dataA.next(batch_size=batch_size)
+			x_target, y_target = self.dataB.next(batch_size=batch_size)
 			z = np.random.normal(0,1, (batch_size,self.noise_size))
-			g_history = self.combined_generator.train_on_batch([z, x_source], [pos])		
+			g_history = self.combined_generator.train_on_batch([z, x_source], [pos, y_source])		
 
 			if (iteration % 50 == 0) and (iteration>0):
-
+				x_target, y_target = self.dataB.next(batch_size=batch_size)
+				y_pred = self.Seg.predict(x_target)
+				y_pred = np.round(y_pred)
+				test_acc = np.mean(y_pred == y_target)
+				if len(seg_test_buffer)>10:
+					seg_test_buffer.pop(0)
+				seg_test_buffer.append(test_acc)
 				if self.algo == "WGAN":
-					message = "{} : [D - loss: {:.3f}, (-) loss: {:.3f}, (+) loss: {:.3f}, (-) acc: {:.2f}%, (+) acc: {:.2f}%], [G - loss: {:.3f} (D_loss_fake)]".format(iteration, 
+					message = "{} : [D - loss: {:.3f}, (-) loss: {:.3f}, (+) loss: {:.3f}, (-) acc: {:.2f}%, (+) acc: {:.2f}%], [GS-loss: {:.3f} G loss: {:.3f}], [S - loss: {:.3f}, acc: {:.2f}] [test acc {:.1f}%]".format(iteration, 
 									d_history[0],
 									d_history[1],
 									d_history[2],
 									100*d_history[3],
 									100*d_history[4],
-									g_history[0])
+									g_history[0],
+									g_history[1],
+									g_history[2],
+									g_history[-1],
+									np.mean(seg_test_buffer)*100)
 				elif self.algo == "WGAN-GP":
-					message = "{} : [D - loss: {:.4f}, GP-loss: {:.4f}, (-) acc: {:.2f}%, (+) acc: {:.2f}%], [G - loss: {:.3f} (D_loss_fake)]".format(iteration, 
+					message = "{} : [D - loss: {:.4f}, GP-loss: {:.4f}, (-) acc: {:.1f}%, (+) acc: {:.1f}%], [GS-loss: {:.3f} G loss: {:.3f}], [S - loss: {:.3f}, acc: {:.1f} %] [test acc {:.1f}%]".format(iteration, 
 									d_history[0],
 									d_history[3],
 									100*d_history[4],
 									100*d_history[5],
-									g_history[0])
+									g_history[0],
+									g_history[1],
+									g_history[2],
+									g_history[-1]*100,
+									np.mean(seg_test_buffer)*100)
 
 				et = time()
 				message = message + " ({:.2f} s)".format(et-st)
@@ -432,12 +489,14 @@ class SimpleGANs(_DLalgo):
 						np.savetxt(csv_file, np.array(d_history).reshape(1,-1), delimiter=",")
 				with open(os.path.join(savehis2dir, "G_Losses.csv"), "ab") as csv_file:
 					np.savetxt(csv_file, np.array(g_history).reshape(1,-1), delimiter=",")
+	def train_seg(self, epochs):
+		self.Seg.compile(loss='binary_crossentropy', 
+			optimizer=self.optimizerG,
+			metrics=["acc"])
+		self.Seg.fit(self.dataB.X, self.dataB.Y, epochs=epochs, batch_size=128)
 
-		self.save_model(save2dir=saveWeights2dir)
-		self.save_weights(save2dir=saveWeights2dir)
 	def deploy(self):
 		return
-
 
 
 
@@ -446,22 +505,25 @@ class SimpleGANs(_DLalgo):
 if __name__ == "__main__":
 	print("Start")
 
+	# if not os.path.exists("./weights"):
+	# 	os.makedirs("./weights")
+	# if not os.path.exists("./output/figures"):
+	# 	os.makedirs("./output/figures")
+	# if not os.path.exists("./output/history"):
+	# 	os.makedirs("./output/history")
 	ALGO = "WGAN-GP"
-	gan = SimpleGANs(dim=2, algo=ALGO)
-	# gan.load_config(verbose=True, from_file="./weights/WGAN-GP/Exp43/config.dill")
+	gan = SimpleDaSeg(dim=2, algo=ALGO)
 	gan.build_model()
-	gan.summary()
-	gan.print_config()
 	# gan.build_model(fromdir="./weights/WGAN-GP/Exp1_bis")
-	
+	gan.summary()
 	# gan.load_data("./data/normal_source.npy", "./data/grid_100.npy", shuffle=True)
 	# gan.load_data("./data/normal_source.npy", "./data/6_clusters.npy", shuffle=True)
-	gan.load_data("./data/normal_source.npy", "./data/spiral_50.npy", shuffle=True)
-	# gan.load_only_generator_weights(weights_path='./weights/WGAN-GP/Exp43')
+	# gan.load_data("./data/normal_source.npy", "./data/spiral_50.npy", shuffle=True)
 
+	gan.load_data(filepaths=["./data/normal_source.npy", "./data/spiral_50.npy", "./data/normal_masks.npy", "./data/spiral_masks2.npy"], shuffle=True)
 
 	try:
-		EXP_NUM = "Exp50"
+		EXP_NUM = "Exp102"
 		gan.write_tensorboard_graph(to_dir="./weights/{}/{}/board".format(ALGO, EXP_NUM), 
 			save_png2dir="./weights/{}/{}".format(ALGO, EXP_NUM))
 		gan.reset_history_in_folder("./output/history/{}/{}".format(ALGO, EXP_NUM))
@@ -474,6 +536,7 @@ if __name__ == "__main__":
 	except KeyboardInterrupt:
 		gan.save_model("./weights/{}/{}_bis".format(ALGO, EXP_NUM))
 		sys.exit(0)
+	# gan.train_seg(10)
 
 
 
@@ -495,20 +558,3 @@ if __name__ == "__main__":
 	# 	file.write(config_message)
 	##########################################
 
-
-	############# Data generation ###############
-	# if not os.path.exists("./data"):
-	# 	os.makedirs("./data")
-	# data = DataDistribution(2)
-	
-	# X = data.create2(500, show=True, seed=17)
-	# np.save("./data/6_clusters.npy", X)
-
-	# X = data.create3(3000, show=True, seed=17)
-	# np.save("./data/normal_source.npy", X)
-
-	# X = data.create4(50, show=True, seed=17)
-	# np.save("./data/grid_100.npy", X)
-	
-	# X = data.create5(60, show=True, seed=17)
-	# np.save("./data/spiral_50.npy", X)
